@@ -1,0 +1,239 @@
+################################################################
+# Project: Fraud Model
+# Description: Deduping and  Macthing Addresses 
+# Author: Actify Data Labs
+# Date: 11 / 01 / 2019
+################################################################
+
+
+####################### Loading Libraries ######################
+# {
+  # library(lsa)
+  # library(tm)
+  # library(dplyr)
+  # library(stringr)
+  # library(stringi)
+  # library(stringdist)
+  # library(data.table)
+  # library(tidyr)
+# }
+equal <- function(x,y){ ifelse (x==y,1,0) }
+
+####################### Loading Data & Dicts ###################
+################################################################
+
+{
+  common_names <- fread(paste0(home_dir,"/model_resources/CommonNames.csv"),header = F, colClasses = "character")
+  state_codes <- fread(paste0(home_dir,"/model_resources/State_Codes.csv"), colClasses = "character")
+  city_data = fread(paste0(home_dir,"/model_resources/city_data.csv"), colClasses = "character")
+  
+  states <- state_codes %>% group_by(CODE) %>% dplyr::summarise(ADDR_STATE = paste0(STATE,collapse = ","))
+  
+  city_list <- city_data %>%
+    group_by(PINCODE) %>%
+    summarise(ADDR_CITY = paste0(unique(CITY),collapse = ","))
+}
+
+################################################################
+################################################################
+
+gen_cosine_similarity <- function(vect,type = "numeric"){
+  if(type == "numeric")
+  {
+    num_addrs <- stri_trim(gsub("\\s+"," ",gsub('[[:alpha:]]','',vect)))
+    num_list <- sapply(num_addrs,strsplit," ",USE.NAMES = F)
+    nums <- unique(unlist(num_list,use.names = F))
+    if(length(nums) == 0)return(cosine(matrix(rep(0,length(vect)),nrow = 1)))
+    num_vecs <- sapply(num_list, function(x){ifelse(nums %in% x,1,0)},USE.NAMES = F)
+    if(!is.matrix(num_vecs)) num_vecs <- matrix(num_vecs,nrow = 1)
+    return(cosine(num_vecs))
+  }else{
+    char_addrs <- stri_trim(gsub("\\s+"," ",gsub('[[:digit:]]','',vect)))
+    char_list <- sapply(char_addrs,strsplit," ",USE.NAMES = F)
+    chars <- unique(unlist(char_list,use.names = F))
+    if(length(chars) == 0)return(cosine(matrix(rep(0,length(vect)),nrow = 1)))
+    char_vecs <- sapply(char_list, function(x){ifelse(chars %in% x,1,0)},USE.NAMES = F)
+    if(!is.matrix(char_vecs))char_vecs <- matrix(char_vecs,nrow = 1)
+    return(cosine(char_vecs))
+  }
+}
+
+
+################### cleaning original data #####################
+################################################################
+
+get_wrong_city_names <- function(city,data,pincode)
+{
+  addrs <- data$ADDR_LN[data$ADDR_ZIP == pincode]
+  city_regex <- paste0(substr(city,start = 1,stop = 2),"(.*?)",
+                       substr(city,start = nchar(city)-1,stop = nchar(city)))
+  words <- str_extract_all(pattern = city_regex,string = addrs) %>% unlist()  
+  return(unique(words[adist(words,city) == 1]))
+}
+
+get_regex <- function(vect){
+  paste0("\\b",vect,"\\b",collapse = "|")
+}
+
+###################### Cleaning Data ##########################
+################################################################
+
+get_clean_data = function(data, normalized = F){
+  ## Attaching State to Actual Dataset
+  data <- dplyr::left_join(data,states,by = c("ADDR_ST" = "CODE"))
+  ## Attaching City to Actual Dataset
+  data_city_list <- filter(city_list, PINCODE %in% data$ADDR_ZIP)
+  data <- dplyr::left_join(data,data_city_list,by = c("ADDR_ZIP" = "PINCODE"))
+  res_list <- sapply(unique(data$ADDR_ZIP), function(x){
+    cities <- data$ADDR_CITY[data$ADDR_ZIP == x] %>% as.character() %>% strsplit(",") %>% unlist() %>% unique()
+    sapply(cities,get_wrong_city_names,data,x,simplify = F)
+  },simplify = F)
+  pins <- c()
+  cities <- c()
+  wrong_names <- c()
+  for(i in 1:length(unique(data$ADDR_ZIP)))
+  {
+    pin <- rep(unique(data$ADDR_ZIP)[i],length(res_list[[i]]))
+    city <- names(res_list[[i]])
+    if(is.null(city))city <- rep(colnames(res_list[[i]]),length(pin))
+    wrong <- c()
+    for(j in 1:length(res_list[[i]]))
+      wrong <- c(wrong,ifelse(length(res_list[[i]][[j]]) == 0,"NA",paste0(unique(res_list[[i]][[j]]),collapse = ",")))
+    
+    wrong_names <- c(wrong_names,wrong)
+    pins <- c(pins,pin)
+    cities <- c(cities,city)
+  }
+  
+  ## Attaching the wrong city names regex to Actual dataset
+  df = data.frame(pins,cities,wrong_names, stringsAsFactors = F)
+  df = data.frame(pin = rep(df$pins,times = 2),city = c(df$cities,df$wrong_names),stringsAsFactors = F)
+  df = df[!df$city == 'NA',]
+  df = dplyr::group_by(df, pin) %>% dplyr::summarise("CITY_REGEX" = paste(city,collapse = ','))
+  data =  dplyr::left_join(data, df,by = c("ADDR_ZIP" = "pin"))
+  
+  
+  return(data)
+}
+
+### generates filtered data given customer reference number ####
+################################################################
+
+
+gen_cust_data <- function(df ){
+  state_regex <- get_regex(unique(unlist(strsplit(df$ADDR_STATE,","),use.names = F)))
+  city_regex <- get_regex(unique(unlist(strsplit(as.character(df$ADDR_CITY),","),use.names = F)))
+  pin_regex <- get_regex(unique(df$ADDR_ZIP))
+  state_code_regex <- get_regex(unique(df$ADDR_ST))
+  
+  str = gsub(paste0(state_regex,state_code_regex,city_regex,pin_regex,collapse = "|"),"",df$ADDR_LN)
+  str = gsub("[^[:alnum:]| ]","",str)
+  str = gsub("\\s+"," ",str)
+  str = trimws(str)
+  df$ADDR_LN <- str
+  return(group_by(df, ADDR_LN,ADDR_ST,ADDR_ZIP,ADDR_STATE,ADDR_CITY) %>% summarize(row_indices = list(index)))
+}
+
+
+######### Clustering address based on given weights ############
+################################################################
+
+
+get_prior_clust = function(addr, state, city, pin, 
+                           weights = c('state' = 0.5, 'city' = 1 ,'pin' = 2,'char' = 4,'num' = 8, 'common' = 8),
+                           method = 'cosine'){
+  controlForMatrix <- list(removePunctuation = TRUE,wordLengths = c(1, Inf))
+  if(length(addr) == 1) return(list(addr))
+  ## state matrix
+  state_mat = sapply(state, equal, state)
+  pin_mat = sapply(pin,equal,pin)
+  ## city matrix
+  city = strsplit(as.character(city),',')
+  city_mat = sapply(city,function(x) sapply(city,function(y) ifelse(length(intersect(x,y))==0,0,1)))
+  ## address splitting (num and char)
+  addr_num = gsub('[[:alpha:]]','',addr)
+  addr_num = trimws(gsub('\\s+',' ',addr_num))
+  addr_char = gsub('[[:digit:]]','',addr)
+  addr_char = trimws(gsub('\\s+',' ',addr_char))
+  addr_char = sapply(addr_char, function(x){
+    strsplit(x,split = ' ') %>% unlist() %>% sort() %>% paste(collapse = ' ')
+  })
+  ## lv
+  lv_char_mat = sapply(addr_char,stringsim,addr_char,method = 'lv')
+  n_cosine_mat = gen_cosine_similarity(addr, type="numeric")
+  n_cosine_mat[is.na(n_cosine_mat)] = 0
+  ## character address
+  c_cosine_mat = gen_cosine_similarity(addr, type="char")
+  # c_cosine_mat = cosine(as.matrix(tdm_caddr))
+  c_cosine_mat[is.na(c_cosine_mat)] = 0
+  
+  final_mat = weights[1]*state_mat + weights[2]*city_mat + weights[3]*pin_mat + 
+    weights[4]*((c_cosine_mat+lv_char_mat)/2) + weights[5]*(n_cosine_mat) 
+  cutoff = sum(weights)*0.6
+  ## Normalising final matrix and clustering
+  model = hclust(as.dist(sum(weights) - final_mat))
+  clusters = cutree(model, h = cutoff)
+  return(clusters)
+}
+
+################################################################
+################################################################
+
+
+addr_match <- function(addr,st,zip,addr_list, st_list, zip_list){
+  addr_df <- data.frame(addr_list, st_list, zip_list, stringsAsFactors = FALSE)
+  colnames(addr_df) <- c("ADDR_LN", "ADDR_ST", "ADDR_ZIP")
+  df <- rbind(c(addr,st,zip), addr_df)
+  df$index <- c(1:nrow(df))
+  clean_df = get_clean_data(df)
+  cust_df = gen_cust_data(clean_df)
+  cust_df$ADDR_LN <- ifelse(is.na(cust_df$ADDR_LN),"",cust_df$ADDR_LN)
+  cust_df$ADDR_ST <- ifelse(is.na(cust_df$ADDR_ST),"",cust_df$ADDR_ST)
+  cust_df$ADDR_CITY <- ifelse(is.na(cust_df$ADDR_CITY),"",cust_df$ADDR_CITY)
+  cust_df$ADDR_ZIP <- ifelse(is.na(cust_df$ADDR_ZIP),"",cust_df$ADDR_ZIP)
+  
+  if (nrow(cust_df) > 1){
+    clust_index <- get_prior_clust(cust_df$ADDR_LN,
+                                   cust_df$ADDR_ST,
+                                   cust_df$ADDR_CITY,
+                                   cust_df$ADDR_ZIP,
+                                   weights = c('state' = 0.5,
+                                               'city' = 1 ,
+                                               'pin' = 2,
+                                               'char' = 4,
+                                               'num' = 8,
+                                               'common'= 0),
+                                   method = 'cosine')
+  }
+  else 
+  {
+    clust_index <- 1
+  }
+  cust_df$clust_index <- clust_index
+  index <- mutate(cust_df, ind_cnt = sapply(row_indices, length))
+  index_df <- data.frame(unlist(index$row_indices), 
+                         rep(index$clust_index, index$ind_cnt)
+  )
+  colnames(index_df) <- c("index", "clust_index") 
+  final_df <- clean_df %>% left_join(index_df, by = c("index" = "index"))
+  first_clust <- final_df$clust_index[1]
+  clust_table <- table(final_df$clust_index) %>% as.data.frame()
+  colnames(clust_table) <- c("clust", "freq")
+  if (clust_table$freq[which(clust_table$clust==first_clust)] > 1) return(1)
+  else return(0)
+}
+
+################################################################
+################################################################
+
+### takes CID and returns unique address
+get_unique_add = function(CID, data, normalize = F, method = 'cosine'){
+  data = data %>% select(REFERENCE_NO,ADDR_LN, ADDR_ST, ADDR_ZIP)
+  data = data[!duplicated(data),]
+  data_cid = get_clean_data(data[data$REFERENCE_NO == CID,],normalize)
+  cust_data = gen_cust_data(CID,data_cid)
+  get_prior_clust(cust_data$ADDR_LN,cust_data$ADDR_ST,cust_data$ADDR_CITY,cust_data$ADDR_ZIP,
+                  weights = c('state' = 0.5, 'city' = 1 ,'pin' = 2,'char' = 4,'num' = 8,
+                              'common' = 4),
+                  method = method) %>% return()
+}
